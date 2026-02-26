@@ -86,54 +86,72 @@
   <body>
     <div class="wrap">
       <div class="card">
-        <h1>OKCoin BTC/ETH BID・ASK</h1>
-        <p class="meta">
-          API: <code>/api/spot/v3/instruments/{instrument_id}/ticker</code> の
-          <code>best_bid</code> / <code>best_ask</code>
-        </p>
+        <p id="last-fetch" class="meta">最終取得: -</p>
+        <p id="ws-status" class="meta">接続状態: 未接続</p>
 
         <table>
           <thead>
             <tr>
+              <th>取引所</th>
               <th>銘柄</th>
               <th>BID</th>
               <th>ASK</th>
-              <th>更新時刻</th>
+              <th>SPREAD</th>
+              <th>SPREAD%</th>
+              <th>データ時刻(API)</th>
             </tr>
           </thead>
           <tbody id="rates-body"></tbody>
         </table>
 
-        <div class="actions">
-          <button id="refresh-btn">今すぐ更新</button>
-        </div>
+        <p id="source" class="meta"></p>
         <p id="error" class="error"></p>
       </div>
     </div>
 
     <script>
-      const API_BASE = "https://www.okcoin.jp/api/spot/v3/instruments";
+      const WS_URL = "wss://connect.okcoin.jp:443/ws/v3";
+      const REST_ORDERBOOK_URL = "https://okj-proxy.yuki-2012g.workers.dev/okj/orderbook";
+      const BITTRADE_ORDERBOOK_URL = "https://okj-proxy.yuki-2012g.workers.dev/bittrade/orderbook";
       const INSTRUMENTS = ["BTC-JPY", "ETH-JPY"];
+      const ORDERBOOK_TOPICS = INSTRUMENTS.map((inst) => `spot/depth5:${inst}`);
+
       const bodyEl = document.getElementById("rates-body");
       const errorEl = document.getElementById("error");
-      const refreshBtn = document.getElementById("refresh-btn");
+      const sourceEl = document.getElementById("source");
+      const lastFetchEl = document.getElementById("last-fetch");
+      const wsStatusEl = document.getElementById("ws-status");
+
+      const latestByInstrument = new Map();
+      const bittradeByInstrument = new Map();
+      let ws;
+      let reconnectTimer;
+      let restTimer;
+      let bittradeTimer;
+      let restFallbackActive = false;
 
       function formatNumber(value) {
         const num = Number(value);
-        return Number.isFinite(num) ? num.toLocaleString("ja-JP") : value;
+        return Number.isFinite(num) ? num.toLocaleString("ja-JP") : "-";
       }
 
       function formatTime(isoString) {
-        const d = new Date(isoString);
+        if (isoString === null || isoString === undefined || isoString === "") return "-";
+        const raw = String(isoString);
+        const asNum = Number(raw);
+        let d;
+        if (Number.isFinite(asNum)) {
+          const ms = raw.length <= 10 ? asNum * 1000 : asNum;
+          d = new Date(ms);
+        } else {
+          d = new Date(raw);
+        }
         return Number.isNaN(d.getTime()) ? "-" : d.toLocaleString("ja-JP");
       }
 
-      async function fetchTicker(instId) {
-        const res = await fetch(`${API_BASE}/${instId}/ticker`);
-        if (!res.ok) {
-          throw new Error(`${instId}: HTTP ${res.status}`);
-        }
-        return res.json();
+      function displayInstrument(instId) {
+        if (!instId) return "-";
+        return String(instId).replace("-JPY", "");
       }
 
       function renderRows(rows) {
@@ -141,9 +159,12 @@
           .map(
             (row) => `
             <tr>
-              <td>${row.instrument_id}</td>
+              <td>${row.exchange}</td>
+              <td>${displayInstrument(row.instrument_id)}</td>
               <td class="bid">${formatNumber(row.best_bid)}</td>
               <td class="ask">${formatNumber(row.best_ask)}</td>
+              <td>${formatNumber(row.best_ask - row.best_bid)}</td>
+              <td>${formatNumber(((row.best_ask - row.best_bid) / row.best_bid) * 100)}%</td>
               <td>${formatTime(row.timestamp)}</td>
             </tr>
           `
@@ -151,20 +172,220 @@
           .join("");
       }
 
-      async function loadRates() {
-        errorEl.textContent = "";
+      function collectRows() {
+        const okjRows = INSTRUMENTS.map((inst) => latestByInstrument.get(inst))
+          .filter(Boolean)
+          .map((row) => ({ ...row, exchange: "OKJ" }));
+        const bittradeRows = INSTRUMENTS.map((inst) => bittradeByInstrument.get(inst))
+          .filter(Boolean)
+          .map((row) => ({ ...row, exchange: "BITTRADE" }));
+        return [...okjRows, ...bittradeRows];
+      }
+
+      function renderFromState() {
+        const rows = collectRows();
+        if (!rows.length) return;
+        const fetchedAt = new Date().toLocaleString("ja-JP");
+        lastFetchEl.textContent = `最終取得: ${fetchedAt}`;
+        renderRows(rows);
+      }
+
+      async function decodeWsPayload(raw) {
+        if (typeof raw === "string") return raw;
+        const bytes =
+          raw instanceof ArrayBuffer
+            ? new Uint8Array(raw)
+            : new Uint8Array(await raw.arrayBuffer());
+
+        const plain = new TextDecoder().decode(bytes);
+        const trimmed = plain.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) return plain;
+
+        if (typeof DecompressionStream === "undefined") {
+          throw new Error("ブラウザがWS圧縮解凍に未対応です");
+        }
+
+        const inflate = async (format) => {
+          const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
+          return new Response(stream).text();
+        };
         try {
-          const rows = await Promise.all(INSTRUMENTS.map(fetchTicker));
-          renderRows(rows);
-        } catch (err) {
-          errorEl.textContent = `取得エラー: ${err.message}`;
+          return await inflate("deflate");
+        } catch (_e) {
+          return await inflate("gzip");
         }
       }
 
-      refreshBtn.addEventListener("click", loadRates);
+      function normalizeOrderbookRow(row) {
+        const inst = row.instrument_id || row.instId;
+        const bids = Array.isArray(row.bids) ? row.bids : [];
+        const asks = Array.isArray(row.asks) ? row.asks : [];
+        const bestBid = bids.length ? Number(bids[0][0]) : NaN;
+        const bestAsk = asks.length ? Number(asks[0][0]) : NaN;
+        if (!inst || !Number.isFinite(bestBid) || !Number.isFinite(bestAsk)) return null;
+        return {
+          instrument_id: inst,
+          best_bid: bestBid,
+          best_ask: bestAsk,
+          timestamp: row.timestamp || row.ts,
+        };
+      }
 
-      loadRates();
-      setInterval(loadRates, 5000);
+      function scheduleReconnect() {
+        if (restFallbackActive) return;
+        clearTimeout(reconnectTimer);
+        wsStatusEl.textContent = "接続状態: 再接続待ち...";
+        reconnectTimer = setTimeout(connectOrderbookWs, 3000);
+      }
+
+      function normalizeRestRow(row) {
+        const inst = row.instrument_id || row.instId;
+        const bestBid = Number(row.best_bid ?? row.bidPx ?? row.bid_price);
+        const bestAsk = Number(row.best_ask ?? row.askPx ?? row.ask_price);
+        if (!inst || !Number.isFinite(bestBid) || !Number.isFinite(bestAsk)) return null;
+        return {
+          instrument_id: inst,
+          best_bid: bestBid,
+          best_ask: bestAsk,
+          timestamp: row.timestamp || row.ts,
+        };
+      }
+
+      async function fetchRestOrderbookOnce() {
+        const res = await fetch(REST_ORDERBOOK_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error("RESTレスポンス形式が不正です");
+        latestByInstrument.clear();
+        for (const item of data) {
+          const row = normalizeRestRow(item);
+          if (row && INSTRUMENTS.includes(row.instrument_id)) {
+            latestByInstrument.set(row.instrument_id, row);
+          }
+        }
+        renderFromState();
+      }
+
+      function startRestFallback(reason) {
+        clearTimeout(reconnectTimer);
+        restFallbackActive = true;
+        if (ws) {
+          try {
+            ws.close();
+          } catch (_e) {}
+          ws = null;
+        }
+        sourceEl.textContent = "取得元: OKJ REST Orderbook / BitTrade REST market/depth";
+        wsStatusEl.textContent = "接続状態: RESTフォールバック中";
+        errorEl.textContent = `WS不安定のためRESTへ切替: ${reason}`;
+        fetchRestOrderbookOnce().catch((err) => {
+          errorEl.textContent = `REST取得エラー: ${err.message}`;
+        });
+        clearInterval(restTimer);
+        restTimer = setInterval(() => {
+          fetchRestOrderbookOnce().catch((err) => {
+            errorEl.textContent = `REST取得エラー: ${err.message}`;
+          });
+        }, 3000);
+      }
+
+      function stopRestFallback() {
+        restFallbackActive = false;
+        clearInterval(restTimer);
+      }
+
+      function normalizeBittradeRow(row) {
+        const inst = row.instrument_id || row.instId;
+        const bestBid = Number(row.best_bid ?? row.bid);
+        const bestAsk = Number(row.best_ask ?? row.ask);
+        if (!inst || !Number.isFinite(bestBid) || !Number.isFinite(bestAsk)) return null;
+        return {
+          instrument_id: inst,
+          best_bid: bestBid,
+          best_ask: bestAsk,
+          timestamp: row.timestamp || row.ts,
+        };
+      }
+
+      async function fetchBittradeOrderbookOnce() {
+        const res = await fetch(BITTRADE_ORDERBOOK_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error("BitTradeレスポンス形式が不正です");
+        bittradeByInstrument.clear();
+        for (const item of data) {
+          const row = normalizeBittradeRow(item);
+          if (row && INSTRUMENTS.includes(row.instrument_id)) {
+            bittradeByInstrument.set(row.instrument_id, row);
+          }
+        }
+        renderFromState();
+      }
+
+      function startBittradePolling() {
+        clearInterval(bittradeTimer);
+        fetchBittradeOrderbookOnce().catch((err) => {
+          errorEl.textContent = `BitTrade取得エラー: ${err.message}`;
+        });
+        bittradeTimer = setInterval(() => {
+          fetchBittradeOrderbookOnce().catch((err) => {
+            errorEl.textContent = `BitTrade取得エラー: ${err.message}`;
+          });
+        }, 3000);
+      }
+
+      function connectOrderbookWs() {
+        stopRestFallback();
+        startBittradePolling();
+        clearTimeout(reconnectTimer);
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          return;
+        }
+
+        errorEl.textContent = "";
+        sourceEl.textContent = "取得元: OKJ Orderbook WebSocket / BitTrade REST market/depth";
+        wsStatusEl.textContent = "接続状態: WS接続中...";
+        ws = new WebSocket(WS_URL);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+          wsStatusEl.textContent = "接続状態: WS接続中";
+          ws.send(JSON.stringify({ op: "subscribe", args: ORDERBOOK_TOPICS }));
+        };
+
+        ws.onmessage = async (event) => {
+          try {
+            const text = await decodeWsPayload(event.data);
+            if (!text || text === "pong") return;
+            const msg = JSON.parse(text);
+            if (msg.event === "error") throw new Error(msg.message || "WS error");
+            if (msg.table === "spot/depth5" && Array.isArray(msg.data)) {
+              for (const item of msg.data) {
+                const row = normalizeOrderbookRow(item);
+                if (row && INSTRUMENTS.includes(row.instrument_id)) {
+                  latestByInstrument.set(row.instrument_id, row);
+                }
+              }
+              renderFromState();
+            }
+          } catch (err) {
+            startRestFallback(err.message);
+          }
+        };
+
+        ws.onerror = () => {
+          wsStatusEl.textContent = "接続状態: WSエラー";
+          startRestFallback("WS接続エラー");
+        };
+
+        ws.onclose = () => {
+          wsStatusEl.textContent = "接続状態: WS切断";
+          ws = null;
+          scheduleReconnect();
+        };
+      }
+
+      connectOrderbookWs();
     </script>
   </body>
 </html>
