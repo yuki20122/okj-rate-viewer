@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OKCoin BTC/ETH BID ASK</title>
+    <style>
+      :root {
+        --bg: #f4f7fb;
+        --card: #ffffff;
+        --text: #1f2937;
+        --muted: #6b7280;
+        --bid: #065f46;
+        --ask: #991b1b;
+        --border: #d1d5db;
+      }
+      body {
+        margin: 0;
+        font-family: "Hiragino Sans", "Yu Gothic", sans-serif;
+        background: linear-gradient(135deg, #eef6ff 0%, #f7fbff 50%, #ffffff 100%);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 760px;
+        margin: 40px auto;
+        padding: 0 16px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 20px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 1.4rem;
+      }
+      .meta {
+        margin: 0 0 16px;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        border-bottom: 1px solid var(--border);
+        padding: 12px 8px;
+        text-align: left;
+      }
+      th {
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+      .bid {
+        color: var(--bid);
+        font-weight: 700;
+      }
+      .ask {
+        color: var(--ask);
+        font-weight: 700;
+      }
+      .actions {
+        margin-top: 14px;
+        display: flex;
+        gap: 8px;
+      }
+      button {
+        background: #0f172a;
+        color: #fff;
+        border: 0;
+        padding: 10px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .error {
+        margin-top: 10px;
+        color: #b91c1c;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>OKCoin BTC/ETH BID・ASK</h1>
+        <p class="meta">
+          API: <code>/api/spot/v3/instruments/{instrument_id}/ticker</code> の
+          <code>best_bid</code> / <code>best_ask</code>
+        </p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>銘柄</th>
+              <th>BID</th>
+              <th>ASK</th>
+              <th>更新時刻</th>
+            </tr>
+          </thead>
+          <tbody id="rates-body"></tbody>
+        </table>
+
+        <div class="actions">
+          <button id="refresh-btn">今すぐ更新</button>
+        </div>
+        <p id="error" class="error"></p>
+      </div>
+    </div>
+
+    <script>
+      const API_BASE = "https://www.okcoin.jp/api/spot/v3/instruments";
+      const INSTRUMENTS = ["BTC-JPY", "ETH-JPY"];
+      const bodyEl = document.getElementById("rates-body");
+      const errorEl = document.getElementById("error");
+      const refreshBtn = document.getElementById("refresh-btn");
+
+      function formatNumber(value) {
+        const num = Number(value);
+        return Number.isFinite(num) ? num.toLocaleString("ja-JP") : value;
+      }
+
+      function formatTime(isoString) {
+        const d = new Date(isoString);
+        return Number.isNaN(d.getTime()) ? "-" : d.toLocaleString("ja-JP");
+      }
+
+      async function fetchTicker(instId) {
+        const res = await fetch(`${API_BASE}/${instId}/ticker`);
+        if (!res.ok) {
+          throw new Error(`${instId}: HTTP ${res.status}`);
+        }
+        return res.json();
+      }
+
+      function renderRows(rows) {
+        bodyEl.innerHTML = rows
+          .map(
+            (row) => `
+            <tr>
+              <td>${row.instrument_id}</td>
+              <td class="bid">${formatNumber(row.best_bid)}</td>
+              <td class="ask">${formatNumber(row.best_ask)}</td>
+              <td>${formatTime(row.timestamp)}</td>
+            </tr>
+          `
+          )
+          .join("");
+      }
+
+      async function loadRates() {
+        errorEl.textContent = "";
+        try {
+          const rows = await Promise.all(INSTRUMENTS.map(fetchTicker));
+          renderRows(rows);
+        } catch (err) {
+          errorEl.textContent = `取得エラー: ${err.message}`;
+        }
+      }
+
+      refreshBtn.addEventListener("click", loadRates);
+
+      loadRates();
+      setInterval(loadRates, 5000);
+    </script>
+  </body>
+</html>
